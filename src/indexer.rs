@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     csv::{create_csv_writers, CsvWriter},
     decode_events::{abi_item_to_topic_id, decode_logs, DecodedLog},
+    gcp_bigquery::{init_gcp_bigquery_db, GcpBigQueryClient},
     postgres::{generate_event_table_indexes, init_postgres_db, PostgresClient},
     provider::get_reth_factory,
     types::{IndexerConfig, IndexerContractMapping},
@@ -110,7 +111,9 @@ async fn sync_state_to_db(
     name: String,
     csv_writer: &mut CsvWriter,
     postgres_db: &mut PostgresClient,
+    gcp_bigquery_db: &mut GcpBigQueryClient,
 ) {
+    // Write to db: postgres
     let copy_query = format!(
         "COPY {} FROM '{}' DELIMITER ',' CSV HEADER",
         name,
@@ -118,7 +121,15 @@ async fn sync_state_to_db(
     );
     info!("executing postgres copy query: {}", copy_query);
     postgres_db.execute(&copy_query, &[]).await.unwrap();
-    // csv_writer.reset();
+
+    // Write to db: gcp bigquery
+    info!("executing gcpbigquery insertion");
+    gcp_bigquery_db
+        .write_csv_to_storage(name.as_str(), &csv_writer)
+        .await;
+
+    // Reset csv data
+    csv_writer.reset();
 }
 
 /// Synchronizes all states from CSV files to the PostgreSQL database.
@@ -138,11 +149,18 @@ async fn sync_all_states_to_db(
     reached_head: bool,
     csv_writers: &mut [CsvWriter],
     postgres_db: &mut PostgresClient,
+    gcp_bigquery_db: &mut GcpBigQueryClient,
 ) {
     for mapping in &indexer_config.event_mappings {
         for abi_item in &mapping.decode_abi_items {
             if let Some(csv_writer) = csv_writers.iter_mut().find(|w| w.name == abi_item.name) {
-                sync_state_to_db(abi_item.name.to_lowercase(), csv_writer, postgres_db).await;
+                sync_state_to_db(
+                    abi_item.name.to_lowercase(),
+                    csv_writer,
+                    postgres_db,
+                    gcp_bigquery_db,
+                )
+                .await;
             }
 
             if !indexer_config.postgres.apply_indexes_before_sync && !reached_head {
@@ -181,6 +199,7 @@ async fn sync_all_states_to_db(
 pub async fn sync(indexer_config: &IndexerConfig) {
     info!("Starting indexer");
 
+    // Init postgres
     let mut postgres_db = init_postgres_db(
         &indexer_config.postgres,
         &indexer_config.event_mappings,
@@ -189,6 +208,13 @@ pub async fn sync(indexer_config: &IndexerConfig) {
     )
     .await
     .expect("Failed to initialize Postgres database");
+
+    // Init gcp bigquery
+    let gcp_bigquery_config = indexer_config.gcp_bigquery.as_ref().unwrap();
+    let mut gcp_bigquery_db =
+        init_gcp_bigquery_db(gcp_bigquery_config, &indexer_config.event_mappings)
+            .await
+            .expect("Failed to initialize GCP connection");
 
     let mut csv_writers = create_csv_writers(
         indexer_config.csv_location.as_path(),
@@ -225,6 +251,7 @@ pub async fn sync(indexer_config: &IndexerConfig) {
                             reached_head,
                             &mut csv_writers,
                             &mut postgres_db,
+                            &mut gcp_bigquery_db,
                         )
                         .await;
                         println!("synced all data to postgres, waiting for new blocks and reth-indexer will now index as they come in.");
@@ -263,6 +290,7 @@ pub async fn sync(indexer_config: &IndexerConfig) {
                         reached_head,
                         &mut csv_writers,
                         &mut postgres_db,
+                        &mut gcp_bigquery_db,
                     )
                     .await;
                     break;
@@ -297,6 +325,7 @@ pub async fn sync(indexer_config: &IndexerConfig) {
                         &provider,
                         &mut csv_writers,
                         &mut postgres_db,
+                        &mut gcp_bigquery_db,
                         mapping,
                         rpc_bloom,
                         block_number,
@@ -314,6 +343,7 @@ pub async fn sync(indexer_config: &IndexerConfig) {
                         reached_head,
                         &mut csv_writers,
                         &mut postgres_db,
+                        &mut gcp_bigquery_db,
                     )
                     .await;
 
@@ -362,6 +392,7 @@ async fn process_block<T: ReceiptProvider + TransactionsProvider + HeaderProvide
     provider: T,
     csv_writers: &mut [CsvWriter],
     postgres_db: &mut PostgresClient,
+    gcp_bigquery_db: &mut GcpBigQueryClient,
     mapping: &IndexerContractMapping,
     rpc_bloom: Bloom,
     block_number: u64,
@@ -397,6 +428,7 @@ async fn process_block<T: ReceiptProvider + TransactionsProvider + HeaderProvide
                     process_transaction(
                         csv_writers,
                         postgres_db,
+                        gcp_bigquery_db,
                         mapping,
                         rpc_bloom,
                         &logs,
@@ -437,6 +469,7 @@ async fn process_block<T: ReceiptProvider + TransactionsProvider + HeaderProvide
 async fn process_transaction(
     csv_writers: &mut [CsvWriter],
     postgres_db: &mut PostgresClient,
+    gcp_bigquery_db: &mut GcpBigQueryClient,
     mapping: &IndexerContractMapping,
     rpc_bloom: Bloom,
     logs: &[Log],
@@ -465,7 +498,13 @@ async fn process_transaction(
                 let kb_file_size = csv_writer.get_kb_file_size();
                 let sync_back_threshold = (0.3333 * mapping.sync_back_every_n_log as f64) as u64;
                 if kb_file_size >= sync_back_threshold {
-                    sync_state_to_db(abi_item.name.to_lowercase(), csv_writer, postgres_db).await;
+                    sync_state_to_db(
+                        abi_item.name.to_lowercase(),
+                        csv_writer,
+                        postgres_db,
+                        gcp_bigquery_db,
+                    )
+                    .await;
                 }
             }
         }
